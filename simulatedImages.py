@@ -13,6 +13,12 @@ import scipy.signal
 import tifffile
 import time
 
+upsamp_for_GT = 10
+
+def nm2px(nm):
+    px_size = 66
+    return upsamp_for_GT * (nm / px_size)
+
 def makeGaussian(size, fwhm = 3, center=None):
     """ Make a square gaussian kernel.
 
@@ -36,18 +42,25 @@ def periodicMatrix(size, period, fwhm, xoffset, yoffset):
     """ Makes a matrix with a periodic distribution of gaussians, simulates
     parallelized RESOLFT on-state PSF
     """
+    nr_of_gauss = np.floor(size / period) # Number of gaussians per dimension  
+    gauss_pos = period + np.arange(nr_of_gauss) * period
+    
     M = np.zeros((size, size))
-    for i in np.arange(size):
-        for j in np.arange(size):
-            if i % period == 0 and j % period == 0 and i != 0 and j != 0:
-                m = makeGaussian(size, fwhm=fwhm, center=[xoffset+i, yoffset+j])
-                M = M+m
+    for i in gauss_pos:
+        for j in gauss_pos:
+            print('Making Gaussian')
+            x = np.round(xoffset + i)
+            y = np.round(yoffset + j)
+            m = makeGaussian(size, fwhm=fwhm, center=[x, y])
+            M = M+m
     return M
     
     
 def circlesMatrix(size, N, noise):
     """ Makes a matrix with many circles of random centres, it is the image
     to evaluate resolution"""
+    
+    size = upsamp_for_GT*size    
     
     M = np.zeros((size, size))
     for i in np.arange(N): 
@@ -58,13 +71,13 @@ def circlesMatrix(size, N, noise):
         donut = (circle < int(size/10+size/500)**2) & (circle > int(size/10-size/500)**2)
         donut = np.array(donut, dtype='int')
         M = M+donut
-    return 1000*M
+    return 10000*M
 
 def addNoise(gtruth, offset, nfac):
         imsize = np.shape(gtruth)[0]
         offsetimg = np.zeros([imsize, imsize]) + offset + 4*np.random.randn(imsize, imsize)
-        poissonian = np.random.poisson(nfac*gtruth, [imsize, imsize])
-        out = offsetimg + poissonian
+        noise = np.random.poisson(gtruth, [imsize, imsize]) + nfac*np.random.randn(imsize, imsize)
+        out = np.abs(offsetimg + noise)
         
         return out
         
@@ -89,39 +102,82 @@ def addNoiseStack(stack, offset, nfac):
 #    return stack
 
 
-def rawStack(image, period, fwhm, step_size):
+def rawStack(image, period, fwhm, steps_per_line):
     """ Generates simulated parallelized RESOLFT raw data stack """
-    imageSize = np.shape(image)[0]
-    pattern = periodicMatrix(imageSize, period, fwhm, 0, 0)
+    period_px = nm2px(period)
+    fwhm_px = nm2px(fwhm)
+    step_size_px = nm2px(period/steps_per_line)
+    GT_size = np.shape(image)[0]
+    OutSize = GT_size / upsamp_for_GT
+    size_ratio = 1/upsamp_for_GT
+    print('Creating pattern')
+    print(GT_size, period_px, fwhm_px)
+    pattern = periodicMatrix(GT_size, period_px, fwhm_px, 0, 0)
     stack = []
     
     # scan is done first right, then down
-    for i in np.arange(period/step_size):
-        for j in np.arange(period/step_size):
-            dx = i*step_size
-            dy = j*step_size
-            frame = pattern*scipy.ndimage.interpolation.shift(image, [dx, dy])
-            frame = ndi.gaussian_filter(frame, 5)
-            stack.append(frame)
+    for i in np.arange(period_px/step_size_px):
+        for j in np.arange(period_px/step_size_px):
+            print('Line: ', i)
+            dx = i*step_size_px
+            dy = j*step_size_px
+            print(dx, dy)
+            shifted = scipy.ndimage.interpolation.shift(image, [dx, dy])
+            frame = pattern*shifted
+            frame = ndi.gaussian_filter(frame, 45)
+            plt.imshow(frame)
+            stack.append(scipy.misc.imresize(frame, size_ratio))
     return stack
 
-size = 400
+size = 200
 offset = 110
-noise = 0.5
-
+noise = 10
+activation = 200
+period = 1000
+steps_per_line = 10
+noise = False
+make_simulated_data = False
+print('Making GT')
 circles = circlesMatrix(size, 56, noise)
 circles = np.array(circles, dtype='uint16')
+print('Noising GT')
 noisedCirc = addNoise(circles, offset, noise)
 noisedCirc = np.array(noisedCirc, dtype='uint16')
-tifffile.imsave('circles_2period.tif', circles)
+tifffile.imsave('circles_large.tif', circles)
+print('Creating rawdata')
+rawstack = rawStack(circles, period, activation, steps_per_line)
 
-darkframe = addNoise(np.ones((size, size)), offset, noise)
-darkframe = np.array(darkframe, dtype='uint16')
-tifffile.imsave('darkframe.tif', darkframe)
+if not noise:
+    rawstack = np.array(rawstack,dtype='uint16')
+else:
+    rawstack = np.array(addNoiseStack(rawstack, offset, noise),dtype='uint16')
+    
+filename = 'rawstack_.tif'
+tifffile.imsave(filename, rawstack)
 
-rawstack = rawStack(circles, 16, 8, 0.5)
-rawstack = np.array(addNoiseStack(rawstack, offset, noise),dtype='uint16')
-tifffile.imsave('rawstack1_p.tif', rawstack)
+
+noise_levels = [0, 10, 100, 500]
+offsets = [100, 200, 400, 1000]
+activation_sizes = [1.5, 3, 8, 16]
+
+if make_simulated_data == True:
+    for n in noise_levels:
+        for o in offsets:
+            for a in activation_sizes:
+                darkframe = addNoise(np.ones((size, size)), o, n)
+                darkframe = np.array(darkframe, dtype='uint16')
+                filename = 'dark_frame_noise_'+str(n)+'_offset_'+str(o)+'_activation_'+str(a)+'.tif'
+                tifffile.imsave(filename, darkframe)
+                
+                rawstack = rawStack(circles, period, a, step_size)
+                rawstack = np.array(addNoiseStack(rawstack, o, n),dtype='uint16')
+                filename = 'rawstack_'+str(n)+'_offset_'+str(o)+'_activation_'+str(a)+'.tif'
+                tifffile.imsave(filename, rawstack)
+            
+
+
+
+
 
 
 
